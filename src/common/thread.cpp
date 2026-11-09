@@ -447,6 +447,207 @@ void RememberCurrentThreadNice(pid_t tid, s32 nice_value) {
 #include "common/x64/rdtsc.h"
 #endif
 
+#ifdef _WIN32
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <vector>
+
+#ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
+#define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
+#endif
+#ifndef THREAD_POWER_THROTTLING_EXECUTION_SPEED
+#define THREAD_POWER_THROTTLING_EXECUTION_SPEED 0x1
+#endif
+
+namespace {
+// Hybrid Intel CPUs (Alder Lake and later, Lunar Lake) report each core's EfficiencyClass through
+// CPU sets; the highest class is the performance cores. FRITCHII_THREAD_PLACEMENT picks the mode:
+//   soft (default): QoS hints plus an ideal processor, the scheduler can still move threads.
+//   pin: threads are restricted to their core group with CPU sets.
+//   off: no placement, the upstream behaviour.
+enum class WinPlacementMode { Off, Soft, Pin };
+
+struct WinCore {
+    ULONG id;
+    WORD group;
+    BYTE index;
+};
+
+struct WinTopology {
+    std::vector<WinCore> performance;
+    std::vector<WinCore> efficiency;
+    WinPlacementMode mode = WinPlacementMode::Soft;
+    std::atomic<u32> next_performance{0};
+    std::atomic<u32> next_efficiency{0};
+
+    bool Hybrid() const {
+        return !performance.empty() && !efficiency.empty();
+    }
+};
+
+WinPlacementMode ReadPlacementMode() {
+    char value[16]{};
+    const DWORD length = GetEnvironmentVariableA("FRITCHII_THREAD_PLACEMENT", value, sizeof(value));
+    if (length == 0 || length >= sizeof(value)) {
+        return WinPlacementMode::Soft;
+    }
+    if (_stricmp(value, "off") == 0 || std::strcmp(value, "0") == 0) {
+        return WinPlacementMode::Off;
+    }
+    if (_stricmp(value, "pin") == 0) {
+        return WinPlacementMode::Pin;
+    }
+    return WinPlacementMode::Soft;
+}
+
+WinTopology* ComputeWinTopology() {
+    auto* topology = new WinTopology();
+    topology->mode = ReadPlacementMode();
+    if (topology->mode == WinPlacementMode::Off) {
+        LOG_INFO(Common, "Thread placement disabled by FRITCHII_THREAD_PLACEMENT");
+        return topology;
+    }
+
+    const HMODULE kernel32 = GetModuleHandle(TEXT("Kernel32.dll"));
+    const auto get_cpu_sets = (decltype(&GetSystemCpuSetInformation))(void*)GetProcAddress(
+        kernel32, "GetSystemCpuSetInformation");
+    if (!get_cpu_sets) {
+        return topology;
+    }
+    ULONG length = 0;
+    get_cpu_sets(nullptr, 0, &length, GetCurrentProcess(), 0);
+    if (length == 0) {
+        return topology;
+    }
+    std::vector<u8> buffer(length);
+    auto* const first = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data());
+    if (!get_cpu_sets(first, length, &length, GetCurrentProcess(), 0)) {
+        LOG_WARNING(Common, "Could not read CPU sets: {}", ::Common::GetLastErrorMsg());
+        return topology;
+    }
+
+    struct Entry {
+        WinCore core;
+        BYTE efficiency_class;
+    };
+    std::vector<Entry> entries;
+    BYTE highest = 0;
+    for (size_t offset = 0; offset < length;) {
+        const auto* entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (entry->Size == 0) {
+            break;
+        }
+        offset += entry->Size;
+        if (entry->Type != CpuSetInformation) {
+            continue;
+        }
+        const auto& set = entry->CpuSet;
+        entries.push_back(
+            Entry{WinCore{set.Id, set.Group, set.LogicalProcessorIndex}, set.EfficiencyClass});
+        highest = (std::max)(highest, set.EfficiencyClass);
+    }
+    for (const auto& entry : entries) {
+        if (entry.efficiency_class == highest) {
+            topology->performance.push_back(entry.core);
+        } else {
+            topology->efficiency.push_back(entry.core);
+        }
+    }
+
+    LOG_INFO(Common, "CPU topology: {} performance cores, {} efficiency cores, placement {}",
+             topology->performance.size(), topology->efficiency.size(),
+             !topology->Hybrid()                         ? "QoS only (symmetric CPU)"
+             : topology->mode == WinPlacementMode::Pin ? "pin"
+                                                         : "soft");
+    return topology;
+}
+
+WinTopology& Topology() {
+    static WinTopology* const topology = ComputeWinTopology();
+    return *topology;
+}
+
+// Opts the current thread out of EcoQoS (or back to the system default), so Windows doesn't
+// lower its clock or move it to efficiency cores on battery or when the window loses focus.
+void SetCurrentThreadHighQoS(bool high) {
+    static const auto set_information = (decltype(&SetThreadInformation))(void*)GetProcAddress(
+        GetModuleHandle(TEXT("Kernel32.dll")), "SetThreadInformation");
+    if (!set_information) {
+        return;
+    }
+    THREAD_POWER_THROTTLING_STATE state{};
+    state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = high ? THREAD_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    state.StateMask = 0;
+    set_information(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state));
+}
+
+void SetCurrentThreadCpuSets(const std::vector<WinCore>* cores) {
+    static const auto set_cpu_sets = (decltype(&SetThreadSelectedCpuSets))(void*)GetProcAddress(
+        GetModuleHandle(TEXT("Kernel32.dll")), "SetThreadSelectedCpuSets");
+    if (!set_cpu_sets) {
+        return;
+    }
+    if (cores == nullptr || cores->empty()) {
+        set_cpu_sets(GetCurrentThread(), nullptr, 0);
+        return;
+    }
+    std::vector<ULONG> ids;
+    ids.reserve(cores->size());
+    for (const auto& core : *cores) {
+        ids.push_back(core.id);
+    }
+    if (!set_cpu_sets(GetCurrentThread(), ids.data(), static_cast<ULONG>(ids.size()))) {
+        LOG_WARNING(Common, "Could not restrict thread to its core group: {}",
+                    ::Common::GetLastErrorMsg());
+    }
+}
+
+// Spreads threads of one group over its cores, so two hot threads don't share an ideal core.
+void SetCurrentThreadIdealCore(const std::vector<WinCore>& cores, std::atomic<u32>& next) {
+    if (cores.empty()) {
+        return;
+    }
+    const WinCore& core = cores[next.fetch_add(1, std::memory_order_relaxed) % cores.size()];
+    PROCESSOR_NUMBER number{};
+    number.Group = core.group;
+    number.Number = core.index;
+    SetThreadIdealProcessorEx(GetCurrentThread(), &number, nullptr);
+}
+
+enum class WinCoreGroup { All, Performance, Efficiency };
+
+void PlaceCurrentThread(WinCoreGroup group) {
+    WinTopology& topology = Topology();
+    if (topology.mode == WinPlacementMode::Off) {
+        return;
+    }
+    SetCurrentThreadHighQoS(group == WinCoreGroup::Performance);
+    if (!topology.Hybrid()) {
+        return;
+    }
+    switch (group) {
+    case WinCoreGroup::Performance:
+        if (topology.mode == WinPlacementMode::Pin) {
+            SetCurrentThreadCpuSets(&topology.performance);
+        }
+        SetCurrentThreadIdealCore(topology.performance, topology.next_performance);
+        break;
+    case WinCoreGroup::Efficiency:
+        if (topology.mode == WinPlacementMode::Pin) {
+            SetCurrentThreadCpuSets(&topology.efficiency);
+        }
+        SetCurrentThreadIdealCore(topology.efficiency, topology.next_efficiency);
+        break;
+    case WinCoreGroup::All:
+        SetCurrentThreadCpuSets(nullptr);
+        break;
+    }
+}
+} // Anonymous namespace
+#endif
+
 namespace Common {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
@@ -546,6 +747,8 @@ void SetCurrentThreadToPerformanceCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
+#elif defined(_WIN32)
+    PlaceCurrentThread(WinCoreGroup::Performance);
 #endif
 }
 
@@ -556,6 +759,8 @@ void SetCurrentThreadToEfficiencyCores() {
         return;
     }
     SetCurrentThreadCoreGroup(CoreGroup::Efficiency);
+#elif defined(_WIN32)
+    PlaceCurrentThread(WinCoreGroup::Efficiency);
 #endif
 }
 
@@ -563,6 +768,8 @@ void SetCurrentThreadToBackgroundWork() {
 #if defined(__ANDROID__)
     ADPF::AddCurrentThread(ADPF::Session::Background);
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
+#elif defined(_WIN32)
+    PlaceCurrentThread(WinCoreGroup::All);
 #endif
 }
 
@@ -570,6 +777,8 @@ void SetCurrentThreadToAllCores() {
 #if defined(__ANDROID__)
     ADPF::RemoveCurrentThread();
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
+#elif defined(_WIN32)
+    PlaceCurrentThread(WinCoreGroup::All);
 #endif
 }
 
